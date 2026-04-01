@@ -74,14 +74,26 @@ export function validateArtifactDir(
   return { valid: true };
 }
 
-export function artifactPathFor(artifactId: string, artifactDir: string): string {
+function artifactStemFor(artifactId: string, artifactDir: string): string {
   if (!isValidArtifactId(artifactId)) {
     throw new Error(`Invalid artifact ID: ${artifactId}`);
   }
   const lowerId = artifactId.toLowerCase();
   const shard1 = lowerId.slice(0, 2);
   const shard2 = lowerId.slice(2, 4);
-  return path.join(artifactDir, shard1, shard2, `${lowerId}.jsonl`);
+  return path.join(artifactDir, shard1, shard2, lowerId);
+}
+
+export function artifactPathFor(artifactId: string, artifactDir: string): string {
+  return `${artifactStemFor(artifactId, artifactDir)}.body`;
+}
+
+function artifactMetadataPathFor(artifactId: string, artifactDir: string): string {
+  return `${artifactStemFor(artifactId, artifactDir)}.meta.json`;
+}
+
+function legacyArtifactPathFor(artifactId: string, artifactDir: string): string {
+  return `${artifactStemFor(artifactId, artifactDir)}.jsonl`;
 }
 
 function ensureDirSync(filePath: string): void {
@@ -90,7 +102,7 @@ function ensureDirSync(filePath: string): void {
 
 async function atomicWriteFile(filePath: string, content: string): Promise<void> {
   ensureDirSync(filePath);
-  const tempPath = path.join(path.dirname(filePath), `.tmp-${crypto.randomUUID()}.jsonl`);
+  const tempPath = path.join(path.dirname(filePath), `.tmp-${crypto.randomUUID()}-${path.basename(filePath)}`);
   try {
     await fs.promises.writeFile(tempPath, content, "utf8");
     await fs.promises.rename(tempPath, filePath);
@@ -104,7 +116,7 @@ async function atomicWriteFile(filePath: string, content: string): Promise<void>
 
 function atomicWriteFileSync(filePath: string, content: string): void {
   ensureDirSync(filePath);
-  const tempPath = path.join(path.dirname(filePath), `.tmp-${crypto.randomUUID()}.jsonl`);
+  const tempPath = path.join(path.dirname(filePath), `.tmp-${crypto.randomUUID()}-${path.basename(filePath)}`);
   try {
     fs.writeFileSync(tempPath, content, "utf8");
     fs.renameSync(tempPath, filePath);
@@ -116,13 +128,70 @@ function atomicWriteFileSync(filePath: string, content: string): void {
   }
 }
 
+async function readLegacyArtifactEnvelope(
+  artifactId: string,
+  artifactDir: string,
+): Promise<ArtifactEnvelope<ArtifactMetadata> | null> {
+  try {
+    const raw = await fs.promises.readFile(legacyArtifactPathFor(artifactId, artifactDir), "utf8");
+    return JSON.parse(raw) as ArtifactEnvelope<ArtifactMetadata>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function readLegacyArtifactEnvelopeSync(
+  artifactId: string,
+  artifactDir: string,
+): ArtifactEnvelope<ArtifactMetadata> | null {
+  try {
+    const raw = fs.readFileSync(legacyArtifactPathFor(artifactId, artifactDir), "utf8");
+    return JSON.parse(raw) as ArtifactEnvelope<ArtifactMetadata>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function writeArtifactFiles(
+  artifactId: string,
+  artifactDir: string,
+  content: string,
+  metadata: ArtifactMetadata,
+): Promise<void> {
+  const bodyPath = artifactPathFor(artifactId, artifactDir);
+  const metadataPath = artifactMetadataPathFor(artifactId, artifactDir);
+  const normalizedMetadata: ArtifactMetadata = { ...metadata, id: artifactId, path: bodyPath };
+  await atomicWriteFile(bodyPath, content);
+  await atomicWriteFile(metadataPath, JSON.stringify(normalizedMetadata));
+}
+
+function writeArtifactFilesSync(
+  artifactId: string,
+  artifactDir: string,
+  content: string,
+  metadata: ArtifactMetadata,
+): void {
+  const bodyPath = artifactPathFor(artifactId, artifactDir);
+  const metadataPath = artifactMetadataPathFor(artifactId, artifactDir);
+  const normalizedMetadata: ArtifactMetadata = { ...metadata, id: artifactId, path: bodyPath };
+  atomicWriteFileSync(bodyPath, content);
+  atomicWriteFileSync(metadataPath, JSON.stringify(normalizedMetadata));
+}
+
 export async function checkArtifactExists(artifactId: string, artifactDir: string): Promise<boolean> {
   if (!isValidArtifactId(artifactId)) return false;
   try {
     await fs.promises.access(artifactPathFor(artifactId, artifactDir), fs.constants.F_OK);
     return true;
   } catch {
-    return false;
+    try {
+      await fs.promises.access(legacyArtifactPathFor(artifactId, artifactDir), fs.constants.F_OK);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -132,7 +201,12 @@ export function checkArtifactExistsSync(artifactId: string, artifactDir: string)
     fs.accessSync(artifactPathFor(artifactId, artifactDir), fs.constants.F_OK);
     return true;
   } catch {
-    return false;
+    try {
+      fs.accessSync(legacyArtifactPathFor(artifactId, artifactDir), fs.constants.F_OK);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -142,22 +216,24 @@ export async function readArtifactMetadata(
 ): Promise<ArtifactMetadata | null> {
   if (!isValidArtifactId(artifactId)) throw new Error(`Invalid artifact ID: ${artifactId}`);
   try {
-    const raw = await fs.promises.readFile(artifactPathFor(artifactId, artifactDir), "utf8");
-    return (JSON.parse(raw) as ArtifactEnvelope<ArtifactMetadata>).metadata ?? null;
+    const raw = await fs.promises.readFile(artifactMetadataPathFor(artifactId, artifactDir), "utf8");
+    return JSON.parse(raw) as ArtifactMetadata;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const legacy = await readLegacyArtifactEnvelope(artifactId, artifactDir);
+    return legacy?.metadata ?? null;
   }
 }
 
 export function readArtifactMetadataSync(artifactId: string, artifactDir: string): ArtifactMetadata | null {
   if (!isValidArtifactId(artifactId)) throw new Error(`Invalid artifact ID: ${artifactId}`);
   try {
-    const raw = fs.readFileSync(artifactPathFor(artifactId, artifactDir), "utf8");
-    return (JSON.parse(raw) as ArtifactEnvelope<ArtifactMetadata>).metadata ?? null;
+    const raw = fs.readFileSync(artifactMetadataPathFor(artifactId, artifactDir), "utf8");
+    return JSON.parse(raw) as ArtifactMetadata;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const legacy = readLegacyArtifactEnvelopeSync(artifactId, artifactDir);
+    return legacy?.metadata ?? null;
   }
 }
 
@@ -167,22 +243,32 @@ export async function readArtifact(
 ): Promise<ArtifactEnvelope<ArtifactMetadata> | null> {
   if (!isValidArtifactId(artifactId)) throw new Error(`Invalid artifact ID: ${artifactId}`);
   try {
-    const raw = await fs.promises.readFile(artifactPathFor(artifactId, artifactDir), "utf8");
-    return JSON.parse(raw) as ArtifactEnvelope<ArtifactMetadata>;
+    const [metadataRaw, content] = await Promise.all([
+      fs.promises.readFile(artifactMetadataPathFor(artifactId, artifactDir), "utf8"),
+      fs.promises.readFile(artifactPathFor(artifactId, artifactDir), "utf8"),
+    ]);
+    return {
+      metadata: JSON.parse(metadataRaw) as ArtifactMetadata,
+      content,
+    };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return readLegacyArtifactEnvelope(artifactId, artifactDir);
   }
 }
 
 export function readArtifactSync(artifactId: string, artifactDir: string): ArtifactEnvelope<ArtifactMetadata> | null {
   if (!isValidArtifactId(artifactId)) throw new Error(`Invalid artifact ID: ${artifactId}`);
   try {
-    const raw = fs.readFileSync(artifactPathFor(artifactId, artifactDir), "utf8");
-    return JSON.parse(raw) as ArtifactEnvelope<ArtifactMetadata>;
+    const metadataRaw = fs.readFileSync(artifactMetadataPathFor(artifactId, artifactDir), "utf8");
+    const content = fs.readFileSync(artifactPathFor(artifactId, artifactDir), "utf8");
+    return {
+      metadata: JSON.parse(metadataRaw) as ArtifactMetadata,
+      content,
+    };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return readLegacyArtifactEnvelopeSync(artifactId, artifactDir);
   }
 }
 
@@ -201,10 +287,10 @@ export async function persistToolResultArtifact(options: PersistOptions): Promis
   try {
     const artifactId = precomputedId ?? computeArtifactId(content);
     if (!isValidArtifactId(artifactId)) throw new Error(`Invalid artifact ID: ${artifactId}`);
-    const filePath = artifactPathFor(artifactId, artifactDir);
+    const bodyPath = artifactPathFor(artifactId, artifactDir);
 
     try {
-      await fs.promises.access(filePath, fs.constants.F_OK);
+      await fs.promises.access(bodyPath, fs.constants.F_OK);
       const existing = await readArtifactMetadata(artifactId, artifactDir);
       if (existing) return { ...existing, isDuplicate: true };
     } catch {}
@@ -215,7 +301,7 @@ export async function persistToolResultArtifact(options: PersistOptions): Promis
       bytes: Buffer.byteLength(content, "utf8"),
       chars: content.length,
       lineCount: countLines(content),
-      path: filePath,
+      path: bodyPath,
       toolName,
       toolCallId,
       exitCode,
@@ -224,8 +310,7 @@ export async function persistToolResultArtifact(options: PersistOptions): Promis
       isDuplicate: false,
     };
 
-    const envelope: ArtifactEnvelope<ArtifactMetadata> = { metadata, content };
-    await atomicWriteFile(filePath, JSON.stringify(envelope));
+    await writeArtifactFiles(artifactId, artifactDir, content, metadata);
     return metadata;
   } catch (error) {
     if (failOpen) return null;
@@ -248,10 +333,10 @@ export function persistToolResultArtifactSync(options: PersistOptions): Artifact
   try {
     const artifactId = precomputedId ?? computeArtifactId(content);
     if (!isValidArtifactId(artifactId)) throw new Error(`Invalid artifact ID: ${artifactId}`);
-    const filePath = artifactPathFor(artifactId, artifactDir);
+    const bodyPath = artifactPathFor(artifactId, artifactDir);
 
     try {
-      fs.accessSync(filePath, fs.constants.F_OK);
+      fs.accessSync(bodyPath, fs.constants.F_OK);
       const existing = readArtifactMetadataSync(artifactId, artifactDir);
       if (existing) return { ...existing, isDuplicate: true };
     } catch {}
@@ -262,7 +347,7 @@ export function persistToolResultArtifactSync(options: PersistOptions): Artifact
       bytes: Buffer.byteLength(content, "utf8"),
       chars: content.length,
       lineCount: countLines(content),
-      path: filePath,
+      path: bodyPath,
       toolName,
       toolCallId,
       exitCode,
@@ -271,8 +356,7 @@ export function persistToolResultArtifactSync(options: PersistOptions): Artifact
       isDuplicate: false,
     };
 
-    const envelope: ArtifactEnvelope<ArtifactMetadata> = { metadata, content };
-    atomicWriteFileSync(filePath, JSON.stringify(envelope));
+    writeArtifactFilesSync(artifactId, artifactDir, content, metadata);
     return metadata;
   } catch (error) {
     if (failOpen) return null;
@@ -284,7 +368,7 @@ export class DiskArtifactStoreBackend implements ArtifactStoreBackend {
   constructor(private readonly artifactDir: string) {}
 
   async write(id: string, content: string, metadata: ArtifactMetadata): Promise<void> {
-    await atomicWriteFile(artifactPathFor(id, this.artifactDir), JSON.stringify({ metadata, content }));
+    await writeArtifactFiles(id, this.artifactDir, content, metadata);
   }
 
   readMetadata(id: string): Promise<ArtifactMetadata | null> {
@@ -297,12 +381,22 @@ export class DiskArtifactStoreBackend implements ArtifactStoreBackend {
 
   async delete(id: string): Promise<boolean> {
     if (!isValidArtifactId(id)) return false;
-    try {
-      await fs.promises.unlink(artifactPathFor(id, this.artifactDir));
-      return true;
-    } catch {
-      return false;
+    const bodyPath = artifactPathFor(id, this.artifactDir);
+    const metadataPath = artifactMetadataPathFor(id, this.artifactDir);
+    const legacyPath = legacyArtifactPathFor(id, this.artifactDir);
+
+    let deleted = false;
+
+    for (const filePath of [bodyPath, metadataPath, legacyPath]) {
+      try {
+        await fs.promises.unlink(filePath);
+        deleted = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
+
+    return deleted;
   }
 }
 
@@ -321,14 +415,18 @@ export async function checkQuota(artifactDir: string): Promise<QuotaInfo> {
     let totalBytes = 0;
     let artifactCount = 0;
     for (const entry of entries) {
-      if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        try {
-          const parentPath = (entry as fs.Dirent & { parentPath?: string }).parentPath ?? artifactDir;
-          const stat = await fs.promises.stat(path.join(parentPath, entry.name));
-          totalBytes += stat.size;
+      if (!entry.isFile()) continue;
+      const isArtifactFile =
+        entry.name.endsWith(".body") || entry.name.endsWith(".meta.json") || entry.name.endsWith(".jsonl");
+      if (!isArtifactFile) continue;
+      try {
+        const parentPath = (entry as fs.Dirent & { parentPath?: string }).parentPath ?? artifactDir;
+        const stat = await fs.promises.stat(path.join(parentPath, entry.name));
+        totalBytes += stat.size;
+        if (entry.name.endsWith(".body") || entry.name.endsWith(".jsonl")) {
           artifactCount += 1;
-        } catch {}
-      }
+        }
+      } catch {}
     }
     return { totalBytes, artifactCount };
   } catch {
@@ -347,13 +445,24 @@ export async function pruneArtifacts(
     const entries = await fs.promises.readdir(artifactDir, { recursive: true, withFileTypes: true });
     const now = Date.now();
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith(".body") && !entry.name.endsWith(".jsonl")) continue;
       try {
         const parentPath = (entry as fs.Dirent & { parentPath?: string }).parentPath ?? artifactDir;
         const filePath = path.join(parentPath, entry.name);
         const stat = await fs.promises.stat(filePath);
         if (maxAgeMs !== undefined && now - stat.mtimeMs > maxAgeMs) {
-          if (!dryRun) await fs.promises.unlink(filePath);
+          if (!dryRun) {
+            await fs.promises.unlink(filePath);
+            if (entry.name.endsWith(".body")) {
+              const metadataPath = filePath.replace(/\.body$/, ".meta.json");
+              try {
+                await fs.promises.unlink(metadataPath);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+              }
+            }
+          }
           removed += 1;
         }
       } catch {}
