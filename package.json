@@ -1,0 +1,65 @@
+{
+  "name": "agent-context-kit",
+  "version": "0.1.0",
+  "description": "Production-grade context window management for AI agents. Tool-output sanitization, content-addressed artifact storage, structured compaction, and context guards.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./sanitizer": {
+      "types": "./dist/sanitizer/tool-result-sanitizer.d.ts",
+      "import": "./dist/sanitizer/tool-result-sanitizer.js"
+    },
+    "./artifacts": {
+      "types": "./dist/artifacts/store.d.ts",
+      "import": "./dist/artifacts/store.js"
+    },
+    "./guards": {
+      "types": "./dist/guards/index.d.ts",
+      "import": "./dist/guards/index.js"
+    },
+    "./compaction": {
+      "types": "./dist/compaction/index.d.ts",
+      "import": "./dist/compaction/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "AGENT-BUILD-GUIDE.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "context-window",
+    "llm",
+    "compaction",
+    "summarization",
+    "tool-output",
+    "artifact",
+    "context-management",
+    "token-management"
+  ],
+  "author": "OpenClaw",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openclaw/agent-context-kit"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
