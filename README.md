@@ -103,7 +103,7 @@ Two layers, working together:
 - **Zero context-overflow crashes** in 2+ months of continuous 24/7 operation
 - **Sub-millisecond classification** — no tokenizer dependency, uses character-based estimation with calibrated ratios (4 chars/token for text, 2 chars/token for tool results)
 - **Compatible with 6+ LLM providers** — Anthropic, OpenAI, Google, xAI, DeepSeek, Mistral. Works with any provider that uses JSON message formats.
-- **Handles 1M-token context windows** — tested with Gemini 1.5 Pro, Claude with extended context
+- **Handles 1M-token context windows** — tested with Gemini 3.1 Pro, Claude Opus 4.6 1M, GPT 5.4 1M
 - **Content-addressed dedup** — identical tool outputs (common in retry loops) are stored once
 - **Fail-open by default** — if artifact storage fails, falls back to inline truncation. Your agent never crashes because of this library.
 
