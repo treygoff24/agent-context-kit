@@ -1,6 +1,6 @@
 # agent-context-kit
 
-Production-grade context window management for AI agents. Extracted from a system that has been running 24/7 since January 2026, managing 1M-token context windows across 6+ LLM providers.
+Context window management utilities for AI agents: tool-result sanitization, content-addressed artifact storage, context-budget guards, and compaction helpers.
 
 Zero dependencies beyond Node.js built-ins.
 
@@ -66,46 +66,43 @@ Two layers, working together:
           │                  │
           │  • tool name     │    "Use `read` with offset/limit,
           │  • head preview  │     or `rg`, `head`, `tail` against
-          │  • tail preview  │     /path/to/artifact.jsonl"
+          │  • tail preview  │     /path/to/artifact.body"
           │  • error hint    │
           │  • extracted URLs│
           │  • recovery hint │
           └──────────────────┘
 
                          ┌─────────────────────────────────┐
-                         │   Layer 2: Compaction Hardening  │
-                         │  (when context pressure is high) │
+                         │  Layer 2: Budget Enforcement +  │
+                         │   caller-owned compaction loop   │
                          └──────────────┬──────────────────┘
                                         │
                                         ▼
           ┌──────────────────────────────────────────────────┐
-          │  Context guard detects pressure                  │
-          │  (estimateContextChars > budget)                 │
+          │  Context guard enforces budget in-place          │
           │                                                  │
-          │  1. Truncate oversized tool results in-place     │
-          │  2. Clear stale tool results (oldest first)      │
-          │  3. If still over → trigger compaction           │
+          │  1. Truncate oversized tool results              │
+          │  2. Clear stale tool results (lowest-priority first) │
+          │  3. If still over and the installed wrapper is   │
+          │     used → throw PREEMPTIVE_CONTEXT_OVERFLOW...  │
           │                                                  │
-          │  Compaction:                                     │
-          │  • Chunk history into summarizer-sized pieces    │
-          │  • Adaptive timeouts (90s → 120s → 300s cap)    │
-          │  • Required sections enforced in output          │
-          │  • Identifier preservation (strict policy)       │
-          │  • Topic locality awareness                      │
-          │  • Quality audit with retry on failure           │
-          │  • Structured fallback if all retries fail       │
+          │  Caller-owned compaction can then use:           │
+          │  • history pruning / chunking utilities          │
+          │  • structured prompt builders                    │
+          │  • topic-locality helpers                        │
+          │  • summary-quality auditing                      │
+          │  • structured fallback summary helper            │
           └──────────────────────────────────────────────────┘
 ```
 
 ## What It Achieves
 
-- **40-60% context usage reduction** through intelligent sanitization of tool outputs
-- **Zero context-overflow crashes** in 2+ months of continuous 24/7 operation
-- **Sub-millisecond classification** — no tokenizer dependency, uses character-based estimation with calibrated ratios (4 chars/token for text, 2 chars/token for tool results)
-- **Compatible with 6+ LLM providers** — Anthropic, OpenAI, Google, xAI, DeepSeek, Mistral. Works with any provider that uses JSON message formats.
-- **Handles 1M-token context windows** — tested with Gemini 3.1 Pro, Claude Opus 4.6 1M, GPT 5.4 1M
-- **Content-addressed dedup** — identical tool outputs (common in retry loops) are stored once
-- **Fail-open by default** — if artifact storage fails, falls back to inline truncation. Your agent never crashes because of this library.
+- **Risk classification for tool results** — `safe`, `oversized`, `blob_like`, or `giant`
+- **Content-addressed artifact storage** — SHA-256 IDs, sharded directories, duplicate detection, atomic writes
+- **Tokenizer-free context estimation** — calibrated character-based estimation for text and tool results
+- **Pre-LLM budget enforcement** — in-place truncation/clearing plus an optional preemptive overflow signal
+- **Compaction helpers** — prompt builders, topic-locality helpers, quality auditing, history pruning, and chunking utilities
+- **Fail-open artifact persistence** — persistence APIs default to returning `null` and falling back cleanly when configured to fail open
 
 ## Installation
 
@@ -151,7 +148,8 @@ const guarded = guardToolResultMessage(
   },
 );
 
-// If the output was >25K chars, `guarded` now contains a stub with:
+// If the output is artifact-worthy (for example >25K chars, blob-like,
+// base64-like, or high-entropy), `guarded` now contains a stub with:
 // - head/tail previews (1200 chars each)
 // - artifact ID (SHA-256 hash)
 // - path to the persisted artifact
@@ -174,7 +172,7 @@ import {
 
 #### `classifyToolResultRisk(content, toolName, config)`
 
-Classifies a tool result into one of four risk categories. Sub-millisecond, no external calls.
+Classifies a tool result into one of four risk categories. Pure function; no external calls.
 
 ```typescript
 import {
@@ -203,10 +201,10 @@ const classification = classifyToolResultRisk(
 |----------|-----------|--------|
 | `safe` | < 12,000 chars | Pass through |
 | `oversized` | 12,000 – 25,000 chars | Inline head+tail truncation |
-| `blob_like` | 25,000 – 64,000 chars, or base64/high-entropy | Artifact + stub |
+| `blob_like` | 25,000 – 64,000 chars, or base64/high-entropy/blob-like content | Artifact + stub |
 | `giant` | > 64,000 chars | Artifact + stub |
 
-Per-tool overrides let you set `aggressive` mode for tools that produce reliably large outputs (halves the thresholds):
+Per-tool overrides let you set `aggressive` mode for tools that produce reliably large outputs (halves the inline/artifact thresholds, but not the giant threshold):
 
 ```typescript
 const config = {
@@ -227,7 +225,6 @@ import {
   sanitizeToolResultForPersistence,
   DEFAULT_TOOL_RESULT_SANITIZER_CONFIG,
   persistToolResultArtifact,
-  computeArtifactId,
 } from "agent-context-kit";
 
 const result = await sanitizeToolResultForPersistence(
@@ -264,7 +261,6 @@ Content-addressed, deduplicated, sharded file storage for oversized tool outputs
 import {
   persistToolResultArtifact,
   readArtifact,
-  computeArtifactId,
   resolveArtifactDir,
   checkQuota,
   pruneArtifacts,
@@ -273,16 +269,17 @@ import {
 
 #### Storage layout
 
-Artifacts are stored as JSONL files in a sharded directory structure:
+Artifacts are stored in a sharded directory structure using the content hash as the filename stem:
 
 ```
 tool-artifacts/
   a1/
     b2/
-      a1b2c3d4e5...full-sha256.jsonl   ← { metadata: {...}, content: "..." }
+      a1b2c3d4e5...full-sha256.body
+      a1b2c3d4e5...full-sha256.meta.json
 ```
 
-Each artifact file contains a JSON envelope with metadata and the full original content.
+Current builds store the artifact body and metadata separately (`.body` + `.meta.json`). The library still reads legacy single-file `.jsonl` envelopes for backward compatibility.
 
 #### `persistToolResultArtifact(options)`
 
@@ -342,18 +339,18 @@ const uninstall = installToolResultContextGuard({
 
 // Now agent.transformContext will:
 // 1. Truncate any single tool result exceeding the per-result budget
-// 2. If total context exceeds budget, compact stale tool results (oldest first)
+// 2. If total context exceeds budget, compact stale tool results (lowest-priority first)
 // 3. Skip artifact-backed stubs (they're already compact)
-// 4. Throw PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE if still over 90% after enforcement
+// 4. Throw PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE if still above the preemptive threshold after enforcement
 
 // To remove the guard:
 uninstall();
 ```
 
 The guard computes budgets from your context window size:
-- **Context budget:** 75% of context window (in estimated chars)
-- **Single tool result max:** 50% of context window or 400K chars (whichever is smaller)
-- **Preemptive overflow:** throws at 90% to trigger compaction before the provider rejects
+- **Context budget:** `contextWindowTokens × CHARS_PER_TOKEN_ESTIMATE × 0.75`
+- **Single tool result max:** `min(contextWindowTokens × TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE × 0.5, HARD_MAX_TOOL_RESULT_CHARS)`
+- **Preemptive overflow threshold:** `max(contextBudgetChars, contextWindowTokens × CHARS_PER_TOKEN_ESTIMATE × 0.9)`
 
 ### Session Guard
 
@@ -534,6 +531,8 @@ const result = pruneHistoryForContextShare({
 });
 
 // result.messages: messages that fit within budget
+// result.droppedMessagesList: the dropped messages
+// result.droppedChunks: number of leading chunks removed
 // result.droppedMessages: count of messages dropped
 // result.droppedTokens: tokens freed
 // result.keptTokens: tokens remaining
@@ -650,9 +649,9 @@ import { buildCompactionInstructions } from "agent-context-kit/compaction";
 
 ### Layer 1: Runtime Tool-Output Guards
 
-When a tool result arrives, the system runs this pipeline synchronously (no async, no network calls for classification):
+When a tool result arrives, the library's sanitization helpers follow this shape:
 
-1. **Extract text** from the message content (handles both `string` and `TextBlock[]` formats).
+1. **Extract text** from the message content. The async sanitizer accepts string content or text blocks; the synchronous session-guard path expects text blocks when sanitizing message content.
 2. **Check for artifact-backed reads** — if the tool is `read` and the path points inside the artifact directory, the system either allows chunked reads through or replaces the content with a recovery hint telling the model to use `offset`/`limit`.
 3. **Classify risk** using character count, Shannon entropy, base64 detection, and line-length heuristics. No tokenizer needed.
 4. **For safe results** (< 12K chars): pass through unchanged.
@@ -664,16 +663,14 @@ The artifact ID is the SHA-256 of the content, so identical outputs (common duri
 
 ### Layer 2: Compaction Engine Hardening
 
-When context pressure builds, the context guard triggers compaction:
+When context pressure builds, the context guard and compaction helpers divide responsibilities cleanly:
 
-1. **Budget calculation**: The guard computes a context budget (75% of the model's context window) and a per-tool-result budget (50% of context or 400K chars max).
-2. **In-place truncation**: Scans tool results from newest to oldest, truncating any that exceed the per-result budget. Artifact-backed stubs are skipped (they're already compact).
-3. **Stale clearing**: If still over budget, replaces the oldest non-stub tool results with `[Old tool result content cleared]`, prioritized by a compaction score that preserves error outputs and recent results.
-4. **Compaction trigger**: If the context exceeds 90% after enforcement, throws `PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE` so your framework can trigger summarization.
-5. **Summary generation**: Your summarizer receives `buildCompactionInstructions()` as a system prompt, requiring five sections (Decisions, Open TODOs, Constraints/Rules, Pending user asks, Exact identifiers).
-6. **Quality audit**: `auditSummaryQuality()` checks the summary for required sections, identifier preservation, topic coverage, and user-ask reflection. Failed audits trigger retries.
-7. **Adaptive timeouts**: Start at 90s, escalate to 120s, cap at 300s. Each retry stage gets more time.
-8. **Structured fallback**: If all retries fail, `buildStructuredFallbackSummary()` produces a minimal valid summary rather than losing everything.
+1. **Budget calculation**: The context guard computes a context budget and a per-tool-result budget from the model's context window.
+2. **In-place truncation**: It scans tool results from newest to oldest, truncating any that exceed the per-result budget. Artifact-backed stubs are skipped.
+3. **Stale clearing**: If still over budget, it replaces the lowest-priority non-stub tool results with `[Old tool result content cleared]`.
+4. **Overflow signaling**: If you installed the wrapper with `installToolResultContextGuard()`, the wrapped `transformContext` throws `PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE` when post-enforcement context still exceeds the preemptive threshold.
+5. **Caller-owned compaction**: Your summarizer can then use `buildCompactionInstructions()`, `buildTopicLocalityInstructions()`, pruning/chunking utilities, and `auditSummaryQuality()`.
+6. **Structured fallback helper**: If your caller decides to fall back, `buildStructuredFallbackSummary()` produces a minimal valid summary.
 
 ### The Stub Format
 
@@ -685,7 +682,7 @@ Status: ERROR (exit code 1)
 Size: 184293 chars, 4521 lines, 184293 bytes
 Type: Structured JSON [preview only - full content stored in artifact]
 Artifact: a1b2c3d4...
-Path: /state/tool-artifacts/a1/b2/a1b2c3d4....jsonl
+Path: /state/tool-artifacts/a1/b2/a1b2c3d4....body
 
 --- Preview (head) ---
 $ npm run build
@@ -700,22 +697,22 @@ URLs (2): https://github.com/..., https://docs.example.com/...
 Paths: src/index.ts, tsconfig.json
 
 💡 Recovery: Use targeted retrieval only. Use `read` with offset/limit,
-or `head`, `tail`, `rg` against /state/tool-artifacts/a1/b2/a1b2c3d4....jsonl
+or `head`, `tail`, `rg` against /state/tool-artifacts/a1/b2/a1b2c3d4....body
 (artifact a1b2c3d4...). Do not request the full artifact or re-dump it into
 the transcript; search/page small sections first to avoid re-artifacting loops.
 ```
 
-Models learn quickly that the recovery hint tells them exactly how to get the information they need. Instead of requesting the full content, they issue targeted reads.
+The recovery hint is explicit about how to retrieve targeted sections instead of re-reading the full artifact.
 
 ## Design Philosophy
 
-**Correctness over speed.** The system never drops an identifier, a file path, a URL, or an error message without preserving a recovery path. Stubs always contain enough preview to understand what the content was, and a path to get more. The quality audit catches summaries that lose track of what the user asked.
+**Correctness over speed.** Oversized content is either truncated with a recovery hint or replaced by a stub that points back to the persisted artifact. If you use the compaction-audit helpers, they can also check whether summaries preserve required sections, identifiers, and the latest ask.
 
 **Transparency over optimization.** Every stub is human-readable. You can grep your transcript for `[Tool result:` and see exactly which outputs were sanitized, how big they were, and where the originals live. There's no opaque compression, no magic tokens, no hidden state.
 
-**Universal JSON over binary formats.** The artifact envelope is `{ metadata: {...}, content: "..." }` — plain JSON. The message types use standard content block arrays that work with Anthropic, OpenAI, Google, and every other provider. No provider-specific serialization.
+**Portable artifact storage over binary blobs.** Artifacts are stored as UTF-8 text bodies plus adjacent JSON metadata files (`.body` + `.meta.json`), with backward-compatible reads for the older JSON envelope format. The message types use standard content block arrays that work with Anthropic, OpenAI, Google, and other providers. No provider-specific serialization.
 
-**Fresh reads over cached stale data.** The system actively teaches models to use targeted retrieval. When a model tries to read an artifact file without chunking parameters, the guard intercepts and returns a hint: "Use `read` with offset/limit." This trains the model to page through large content instead of dumping it all into context.
+**Fresh reads over cached stale data.** When the sanitizer detects an oversized `read` against a persisted artifact path with no chunking parameters, it returns a recovery hint telling the model to use `read` with `offset`/`limit` or other targeted retrieval.
 
 **Fail-open by default.** If the artifact directory doesn't exist, if the disk is full, if the hash somehow collides — the system falls back to inline truncation. `failOpen: true` is the default on every persistence call. Your agent keeps working; it just has less context.
 
@@ -730,7 +727,7 @@ See [AGENT-BUILD-GUIDE.md](./AGENT-BUILD-GUIDE.md) for detailed integration inst
 
 ## Credits
 
-Extracted from the [OpenClaw](https://openclaw.com) agent framework, where it has been managing context windows for persistent AI agents in production since January 2026.
+Extracted from the [OpenClaw](https://openclaw.com) agent framework.
 
 <!-- TODO: Link to blog post about the extraction -->
 

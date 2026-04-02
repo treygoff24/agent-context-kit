@@ -2,96 +2,76 @@
 
 ## What Was Done
 
-### 1. Code Review and Cleanup
+### 1. Source Layout Reviewed
 
-**Files reviewed:** All 10 TypeScript source files (~2,800 lines).
+**Files reviewed:** All 13 TypeScript source files currently present under `src/`.
 
-**Deployment-specific content removed:**
-- `compaction/instructions.ts` — Removed all hardcoded deployment-specific arrays:
-  - `SEMANTIC_TOPIC_SIGNAL_CANDIDATES` (contained "google sheets", "meeting tracker", "stakeholder map", etc.)
-  - `OFF_TOPIC_TODO_MARKERS` (contained "oliveous hq", "specgate launch", "dylan calls before the panel", etc.)
-  - `GLOBAL_STATUS_MARKERS` (contained deployment-specific patterns like "compaction fix shipped", "workspace-critical-rules")
-  - `extractLowercaseTopicPhrases` hardcoded candidates list
-- `compaction/config.ts` — Replaced `memory/entity-index.json`, `memory/agents`, `memory/learning/context-engine-metrics.jsonl`, `memory/learning/relevance-log.jsonl` paths with generic relative paths.
+Reviewed files:
+- `src/index.ts`
+- `src/types.ts`
+- `src/sanitizer/tool-result-sanitizer.ts`
+- `src/artifacts/store.ts`
+- `src/guards/char-estimator.ts`
+- `src/guards/context-guard.ts`
+- `src/guards/index.ts`
+- `src/guards/session-guard.ts`
+- `src/guards/truncation.ts`
+- `src/compaction/config.ts`
+- `src/compaction/index.ts`
+- `src/compaction/instructions.ts`
+- `src/compaction/utils.ts`
 
-**What replaced them:** A new `CompactionInstructionsConfig` interface with:
-- `topicSignalCandidates` — empty by default, callers populate for their domain
-- `offTopicMarkers` — empty by default
-- `globalStatusPatterns` — minimal sensible defaults (generic patterns like "open todos", "project status")
-- `lowercaseTopicPhrases` — empty by default
-- `metadataLinePrefixes` — empty by default
+### 2. Current Source Capabilities
 
-Configuration is set via `configureCompactionInstructions()` at startup and read via `getCompactionInstructionsConfig()`. All functions that referenced the old constants now read from the config.
+**Types and public API:**
+- `src/types.ts` defines the shared message, transcript, summarizer, runtime, and artifact envelope types.
+- `src/index.ts` re-exports the package's public API across sanitizer, artifacts, guards, and compaction modules.
+- `src/guards/index.ts` and `src/compaction/index.ts` provide sub-barrel exports.
 
-**What was already clean (no changes needed):**
-- `types.ts` — fully framework-agnostic
-- `artifacts/store.ts` — no deployment-specific content
-- `sanitizer/tool-result-sanitizer.ts` — no deployment-specific content
-- `guards/char-estimator.ts` — clean
-- `guards/context-guard.ts` — clean
-- `guards/session-guard.ts` — clean
-- `guards/truncation.ts` — clean
-- `compaction/utils.ts` — clean
+**Artifact persistence:**
+- `src/artifacts/store.ts` implements SHA-256-based artifact IDs, validation for relative artifact directories, atomic writes, metadata/body split storage, legacy `.jsonl` compatibility, duplicate detection, quota checks, pruning, and a disk-backed store backend.
 
-**Verification:** `grep -rn` scan for deployment-specific terms (oliveous, specgate, openclaw, treygoff, lumen, prospera, etc.) returns zero hits across all source files.
+**Tool-result sanitization and guardrails:**
+- `src/sanitizer/tool-result-sanitizer.ts` classifies tool output risk (`safe`, `oversized`, `blob_like`, `giant`), extracts structured facts, detects artifact-backed read recovery cases, formats transcript stubs for persisted artifacts, and provides async sanitization helpers.
+- `src/guards/char-estimator.ts` estimates message/context character counts with special handling for tool results and image blocks.
+- `src/guards/truncation.ts` truncates oversized tool results with head/tail preservation and context-window-based sizing helpers.
+- `src/guards/context-guard.ts` enforces tool-result context budgets, preserves artifact-backed stubs, and installs a transform hook that throws on preemptive overflow.
+- `src/guards/session-guard.ts` composes sync sanitization, artifact persistence, and post-hook invariants for tool-result messages.
 
-### 2. Package Skeleton
+**Compaction utilities:**
+- `src/compaction/config.ts` defines the package config surface, default config, config resolution, and phase checks.
+- `src/compaction/instructions.ts` defines required summary sections, compaction instruction builders, topic-locality extraction/filtering, summary quality auditing, and a structured fallback summary.
+- `src/compaction/utils.ts` provides token estimation, message text extraction, chunking, adaptive chunk sizing, oversized-summary checks, and history pruning by context share.
 
-**Created:**
-- `package.json` — name `agent-context-kit`, ESM, MIT license, proper exports map with subpath exports (`./sanitizer`, `./artifacts`, `./guards`, `./compaction`)
-- `tsconfig.json` — ES2022 target, Node16 module resolution, strict mode, declaration generation
-- `src/index.ts` — barrel export with every public type and function organized by subsystem
-- `src/guards/index.ts` — sub-barrel for guards subpath
-- `src/compaction/index.ts` — sub-barrel for compaction subpath
-- `.gitignore` — node_modules, dist, .DS_Store, etc.
-- `LICENSE` — MIT
+### 3. Current Configuration Shape
 
-**Compilation:** `npx tsc --noEmit` passes clean with zero errors or warnings.
+`src/compaction/instructions.ts` currently exposes a configurable `CompactionInstructionsConfig` with:
+- `topicSignalCandidates`
+- `offTopicMarkers`
+- `globalStatusPatterns`
+- `metadataLinePrefixes`
+- `lowercaseTopicPhrases`
 
-### 3. README.md (739 lines)
+Current defaults in source:
+- `topicSignalCandidates`: empty array
+- `offTopicMarkers`: empty array
+- `globalStatusPatterns`: generic regex defaults such as `current progress`, `open todos`, `project status`, and `daily digest`
+- `metadataLinePrefixes`: empty array
+- `lowercaseTopicPhrases`: empty array
 
-Comprehensive README covering:
-- Problem statement with concrete failure modes
-- ASCII architecture diagram
-- Production metrics
-- Installation and quick start
-- Full API reference with code examples for every major function
-- How It Works (both layers explained in detail)
-- Design Philosophy (5 principles)
-- Credits and license
+`src/compaction/config.ts` currently uses these generic default paths/values:
+- `entityIndexPath: "entity-index.json"`
+- `psmDir: "agents"`
+- `metricsPath: "context-engine-metrics.jsonl"`
+- `relevanceLogPath: "relevance-log.jsonl"`
 
-### 4. AGENT-BUILD-GUIDE.md (1,891 lines)
+### 4. Verified File Counts
 
-Extremely detailed integration guide covering:
-- Architecture overview with component boundaries and coupling analysis
-- 5 integration points with exact hook locations
-- Step-by-step adaptation for 5 targets: Custom loops, LangChain, AutoGen, CrewAI, OpenClaw
-- Complete configuration reference for every parameter
-- Compaction prompt format with customization for coding/research/conversational agents
-- 5 production failure modes with root cause analysis and fixes
-- Tuning guide for 3 context window tiers and 3 agent types
-- Testing strategy with code examples and metrics
-- 3 appendices: import reference, message format mapping, error handling table
-
-## Decisions Made
-
-1. **Empty defaults for topic signals/markers.** Rather than keeping generic placeholder content that might confuse users, the topic-related config arrays default to empty. This makes it explicit that callers need to populate them for their domain. The `globalStatusPatterns` array retains a few truly generic patterns (like "open todos", "project status") since those apply universally.
-
-2. **Config paths made generic.** The original `memory/entity-index.json` etc. paths implied a specific directory structure. Changed to bare filenames (`entity-index.json`, `agents`) so callers compose paths relative to their own state directory.
-
-3. **Kept ContextKitPhases as-is.** The phase flags (channelPartitioning, workspaceRecovery, etc.) are deployment feature flags, but they're part of the config system that the compaction engine reads. Removing them would break the config resolver. They default to `false` and are ignorable.
-
-4. **Subpath exports.** Added `agent-context-kit/sanitizer`, `agent-context-kit/artifacts`, `agent-context-kit/guards`, `agent-context-kit/compaction` for tree-shaking. Users who only need the sanitizer don't have to pull in compaction.
-
-5. **No runtime dependencies.** The package uses only Node.js built-ins (crypto, fs, path). TypeScript is a devDependency only.
-
-## Final File Count
-
-```
+```text
 src/index.ts                           176 lines
 src/types.ts                           111 lines
 src/sanitizer/tool-result-sanitizer.ts 709 lines
-src/artifacts/store.ts                 369 lines
+src/artifacts/store.ts                 478 lines
 src/guards/char-estimator.ts           117 lines
 src/guards/context-guard.ts            220 lines
 src/guards/session-guard.ts            354 lines
@@ -101,9 +81,17 @@ src/compaction/config.ts               213 lines
 src/compaction/instructions.ts         452 lines
 src/compaction/utils.ts                169 lines
 src/compaction/index.ts                  3 lines
-README.md                              739 lines
-AGENT-BUILD-GUIDE.md                 1,891 lines
 ─────────────────────────────────────────────
-Total source                         3,033 lines
-Total docs                           2,630 lines
+Total src                             3,142 lines
 ```
+
+## Decisions Made
+
+1. **This summary is limited to what is verifiable from the current repository state.** Historical claims about what was removed or changed were omitted unless directly provable from the present source tree.
+2. **The source tree currently contains 13 TypeScript files, not 10.** Both barrel files under `src/guards/index.ts` and `src/compaction/index.ts`, plus `src/index.ts`, are part of the audited source set.
+3. **Current line counts were corrected to match the repository.** In particular, `src/artifacts/store.ts` is 478 lines, not 369.
+4. **Current code is generic in the places reviewed.** The compaction instruction config and default config use generic arrays/patterns and generic relative paths as described above.
+
+## Notes
+
+Additional repository files such as `package.json`, `tsconfig.json`, `.gitignore`, `LICENSE`, `README.md`, and `AGENT-BUILD-GUIDE.md` exist, but this audit was scoped to `SUMMARY.md` versus the actual source code under `src/`.

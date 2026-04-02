@@ -2,11 +2,11 @@
 
 ## How to integrate `agent-context-kit` into any AI agent runtime
 
-This document is the complete integration manual for `agent-context-kit` — a production-grade context window management library extracted from [OpenClaw](https://github.com/openclaw/openclaw). It is written for AI engineers and AI agents performing integration work. Every function signature, import path, and configuration parameter is documented with precision.
+This document is an integration manual for `agent-context-kit`, extracted from [OpenClaw](https://github.com/openclaw/openclaw). It is written for AI engineers and AI agents wiring the package into their own runtimes.
 
-**What this library does:** Prevents context window blowouts in long-running AI agent sessions by sanitizing oversized tool outputs, storing them in content-addressed artifacts, enforcing context budgets, and producing structured summaries when compaction is needed.
+**What this library does:** Sanitizes oversized tool outputs, stores large results in content-addressed artifacts, enforces context budgets, and provides compaction helpers such as prompt builders, topic-locality helpers, quality auditing, and history-pruning utilities.
 
-**What this library does NOT do:** It does not call LLMs directly. The compaction subsystem generates *instructions* and *prompts* for a summarizer — you provide the summarizer client. The sanitizer and guards are fully self-contained and require no LLM calls.
+**What this library does NOT do:** It does not call LLMs directly and it does not implement a full summarization/retry loop for you. The compaction subsystem provides *instructions*, *audit helpers*, and *utility functions* for a summarizer that you supply.
 
 ---
 
@@ -38,7 +38,7 @@ agent-context-kit
 │   ├── context-guard.ts    # Pre-LLM-call (context budget enforcement)
 │   ├── truncation.ts       # Low-level text truncation utilities
 │   └── char-estimator.ts   # Token/char estimation with caching
-└── compaction/         # Structured summary generation when context is full
+└── compaction/         # Config, prompt, audit, and pruning helpers for caller-owned compaction
     ├── config.ts           # Configuration types and resolution
     ├── instructions.ts     # Prompt generation, quality auditing, topic locality
     └── utils.ts            # Chunking, token estimation, history pruning
@@ -187,7 +187,7 @@ const config: ToolResultHandlingConfigInput = {
 **What it does:**
 1. Truncates any individual tool result that exceeds the single-result budget
 2. If total context still exceeds budget: progressively clears stale tool results (lowest priority first)
-3. If context STILL exceeds the preemptive overflow threshold: throws `Error` with `PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE`
+3. If you install the wrapper via `installToolResultContextGuard()`, it additionally throws `Error` with `PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE` when post-enforcement context still exceeds the preemptive overflow threshold
 
 **Entry point:**
 
@@ -218,9 +218,9 @@ enforceToolResultContextBudgetInPlace({
 ```
 
 **Budget calculation internals:**
-- `contextBudgetChars = contextWindowTokens × 4 (CHARS_PER_TOKEN_ESTIMATE) × 0.75 (headroom ratio)`
-- `maxSingleToolResultChars = contextWindowTokens × 2 (TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE) × 0.5 (single result share)`, capped at `HARD_MAX_TOOL_RESULT_CHARS` (400,000)
-- `preemptiveOverflowChars = contextWindowTokens × 4 × 0.9`
+- `contextBudgetChars = max(1024, floor(contextWindowTokens × CHARS_PER_TOKEN_ESTIMATE × 0.75))`
+- `maxSingleToolResultChars = max(1024, min(floor(contextWindowTokens × TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE × 0.5), HARD_MAX_TOOL_RESULT_CHARS))`
+- `preemptiveOverflowChars = max(contextBudgetChars, floor(contextWindowTokens × CHARS_PER_TOKEN_ESTIMATE × 0.9))`
 
 **Compaction priority (lowest = cleared first):**
 
@@ -270,8 +270,8 @@ import {
   extractTopicLocalityContext,
   extractOpaqueIdentifiers,
   extractLatestUserAsk,
+  extractMessageText,
   configureCompactionInstructions,
-  type CompactionInstructionsConfig,
 } from "agent-context-kit/compaction";
 
 // Optional: configure domain-specific signals (call once at startup)
@@ -292,7 +292,7 @@ const topicContext = extractTopicLocalityContext(messages);
 const localityBlock = buildTopicLocalityInstructions(topicContext);
 
 // Extract identifiers that MUST be preserved in the summary
-const fullText = messages.map(m => extractMessageTextContent(m)).join("\n");
+const fullText = messages.map((m) => extractMessageText(m)).join("\n");
 const identifiers = extractOpaqueIdentifiers(fullText);
 const latestAsk = extractLatestUserAsk(messages);
 
@@ -306,8 +306,7 @@ const systemPrompt = [instructions, localityBlock].filter(Boolean).join("\n\n");
 import {
   pruneHistoryForContextShare,
   chunkMessagesByMaxTokens,
-  estimateMessagesTokens,
-  stripToolResultDetails,
+  getMergeSummariesInstructions,
 } from "agent-context-kit/compaction";
 
 // Prune history to fit within the summarizer's context window
@@ -319,7 +318,8 @@ const { messages: prunedMessages, droppedTokens } = pruneHistoryForContextShare(
 
 // If still too large, chunk and summarize in parts
 const chunks = chunkMessagesByMaxTokens(prunedMessages, summarizerContextWindow * 0.4);
-// Summarize each chunk, then merge with getMergeSummariesInstructions()
+const mergeInstructions = getMergeSummariesInstructions();
+// Summarize each chunk, then merge using mergeInstructions
 ```
 
 **Step 3: Audit summary quality**
@@ -349,9 +349,9 @@ if (!audit.ok) {
 
 ### 2.5 Artifact Lifecycle
 
-**Creation:** Artifacts are created by the sanitizer when a tool result exceeds `artifactChars` or is detected as blob-like. The artifact ID is the SHA-256 hash of the content.
+**Creation:** Artifacts are created by the sanitizer when a tool result is too large for inline retention (`artifactChars` / giant-result thresholds) or is detected as blob-/artifact-worthy content (for example base64-like, high-entropy, or very long-line payloads). The artifact ID is the SHA-256 hash of the content.
 
-**Storage format:** `{artifactDir}/{shard1}/{shard2}/{id}.jsonl` where shard1 = first 2 hex chars, shard2 = next 2 hex chars. Each file is a JSON envelope: `{ metadata: ArtifactMetadata, content: string }`.
+**Storage format:** artifacts are sharded under `{artifactDir}/{shard1}/{shard2}/` using the content hash as the filename stem. Current builds store the body and metadata separately as `{id}.body` and `{id}.meta.json`. The library also still reads legacy `{id}.jsonl` envelopes for backward compatibility.
 
 **Deduplication:** If the same content is persisted twice, the second call returns the existing metadata with `isDuplicate: true`. No disk write occurs.
 
@@ -440,6 +440,7 @@ while (true) {
   if (currentChars / budgetChars > 0.8) {
     // Run compaction (see Section 2.4)
     const summary = await runCompaction(messages);
+    const recentTurnsPreserve = 3; // matches the library's default compaction config
     // Replace history with summary + recent turns
     messages.splice(0, messages.length - recentTurnsPreserve, {
       type: "compaction",
@@ -473,13 +474,11 @@ while (true) {
 LangChain tools return results through the tool execution pipeline. Hook into the output processing:
 
 ```typescript
-import { createSyncSanitizerTransform } from "agent-context-kit/guards";
 import {
-  installToolResultContextGuard,
-  type ContextGuardAgent,
+  createSyncSanitizerTransform,
+  enforceToolResultContextBudgetInPlace,
 } from "agent-context-kit/guards";
 import type { ToolResultHandlingConfigInput } from "agent-context-kit/guards";
-import { ToolMessage } from "@langchain/core/messages";
 import { RunnableLambda } from "@langchain/core/runnables";
 
 // === Tool Output Wrapper ===
@@ -502,7 +501,7 @@ function wrapToolWithSanitizer<T extends { name: string }>(tool: T): T {
   (tool as any).invoke = async (input: any, config?: any) => {
     const result = await original(input, config);
 
-    // Convert LangChain ToolMessage to AgentMessage for sanitization
+    // Convert the LangChain tool result into an AgentMessage for sanitization
     const agentMsg = {
       role: "toolResult" as const,
       toolName: (tool as any).name,
@@ -577,7 +576,7 @@ class ContextKitTransform {
       role: "toolResult" as const,
       toolName: message.name ?? "unknown",
       toolCallId: message.tool_call_id,
-      content: [{ type: "text" as const, text: message.content }],
+      content: [{ type: "text" as const, text: typeof message.content === "string" ? message.content : JSON.stringify(message.content) }],
     };
 
     const sanitized = sanitize(agentMsg, {
@@ -662,11 +661,13 @@ function withContextKit(tool: any): any {
 OpenClaw is the framework this library was extracted from. The integration is the most complete:
 
 ```typescript
+import type { AgentMessage } from "agent-context-kit";
 import {
   createSyncSanitizerTransform,
   enforcePostHookInvariants,
   installToolResultContextGuard,
   type GuardHooks,
+  type ToolResultPersistMeta,
 } from "agent-context-kit/guards";
 import {
   buildCompactionInstructions,
@@ -734,7 +735,7 @@ type ToolResultSanitizerConfig = {
 |-------|----------|
 | `"off"` | Sanitizer is completely disabled. All tool results pass through unchanged. |
 | `"standard"` | Default. Applies thresholds as configured. |
-| `"aggressive"` | Not a separate mode at the config level — use per-tool `"aggressive"` mode instead. |
+| `"aggressive"` | Accepted at the top level by the config types, but the current implementation treats it the same as `"standard"`. Only per-tool `"aggressive"` mode actually halves thresholds. |
 
 #### `thresholds`
 
@@ -764,14 +765,14 @@ type ToolResultSanitizerConfig = {
 | `base64RatioThreshold` | `0.9` | If ≥90% of characters are base64-alphabet characters, classify as base64-like. |
 | `highEntropyThreshold` | `4.2` | Shannon entropy above this marks content as high-entropy (binary, compressed, encoded data). English text is typically 3.5-4.0. |
 | `enableBlobDetection` | `true` | Enable line-length-based blob detection. |
-| `enableHashDedup` | `true` | Enable content-hash deduplication. Identical tool outputs share the same artifact. |
+| `enableHashDedup` | `true` | Present in the config type, but currently not consulted by the implementation. Artifact dedup still happens because artifact IDs are content hashes. |
 
 #### `staleClearing`
 
 | Parameter | Default | What it does |
 |-----------|---------|-------------|
-| `enabled` | `true` | Allow the context guard to clear stale tool results. |
-| `placeholder` | `"[Old tool result content cleared]"` | Replacement text for cleared results. |
+| `enabled` | `true` | Present in the config type, but the current guards do not read this flag yet; stale-result clearing is currently hard-coded in the context guard. |
+| `placeholder` | `"[Old tool result content cleared]"` | Present in the config type, but the current guards do not read this value yet; the placeholder text is currently hard-coded. |
 
 #### `tools` (per-tool overrides)
 
@@ -791,7 +792,7 @@ tools: {
 
 ### 4.2 `CompactionConfig`
 
-Controls the compaction process — how summaries are generated and quality-gated.
+`CompactionConfig` is a resolved config shape exported by `src/compaction/config.ts`. In the current source tree, these values are surfaced by `DEFAULT_CONFIG` / `resolveConfig()`, but this package does not itself run a full compaction loop or consume most of these fields outside config resolution. Treat them as defaults for your caller-owned compaction pipeline.
 
 ```typescript
 interface CompactionConfig {
@@ -814,28 +815,28 @@ interface CompactionConfig {
 
 | Parameter | Default | What it does | Too high | Too low |
 |-----------|---------|-------------|----------|---------|
-| `recentTurnsPreserve` | `3` | Number of most-recent conversation turns preserved verbatim (not summarized). | Wastes context on turns that could be summarized. | Loses critical recent context. Model forgets what just happened. |
-| `qualityGuardEnabled` | `true` | Run `auditSummaryQuality` on generated summaries. Failed audits trigger retry. | N/A (boolean) | Summaries may drop identifiers or miss topics. |
-| `qualityGuardMaxRetries` | `1` | Max retries after a failed quality audit. | Adds latency (each retry is an LLM call). | May accept low-quality summaries. |
-| `maxHistoryShare` | `0.5` | Maximum fraction of the summarizer's context window to use for history. The rest is reserved for the summary output + instructions. | Risks output truncation in the summarizer. | Drops too much history before summarization. |
-| `identifierPolicy` | `"strict"` | `"strict"`: require identifier preservation in summaries. `"off"`: skip identifier checks. | N/A | `"off"` allows summaries that drop UUIDs, file paths, API keys, etc. |
-| `timeoutMs` | `90,000` | Initial timeout for the summarizer call. | Slow sessions wait too long. | Timeouts on large contexts. |
-| `timeoutMsBase` | `120,000` | Base timeout for retry stages. | Wasted time on genuinely stuck calls. | Premature timeouts on retry. |
-| `timeoutMsCap` | `300,000` | Maximum timeout (final retry). | 5+ minutes waiting on a single summarization. | Summary fails on legitimately large contexts. |
-| `oversizedToolResultChars` | `16,000` | Threshold for compaction-time tool result handling. | Large results inflate compaction input. | Strips useful context. |
-| `giantToolResultChars` | `64,000` | Giant threshold during compaction. | — | — |
-| `previewHeadChars` | `400` | Head preview chars during compaction (distinct from sanitizer preview). | — | — |
-| `previewTailChars` | `400` | Tail preview chars during compaction. | — | — |
-| `maxStabilityRetryStages` | `3` | Max number of timeout escalation stages (each increases timeout). | Adds latency. | Gives up too early. |
+| `recentTurnsPreserve` | `3` | Default value exposed for callers that want to keep the most recent turns verbatim during their own compaction flow. | Keeps more raw history than your app needs. | Leaves less recent verbatim context in your app's summary handoff. |
+| `qualityGuardEnabled` | `true` | Default knob a caller can use to decide whether to run `auditSummaryQuality()` after summary generation. | Your app spends more time validating summaries. | Your app may skip a useful validation step. |
+| `qualityGuardMaxRetries` | `1` | Default retry budget for caller-owned summary regeneration. This package does not execute the retry loop itself. | Your app may spend extra LLM calls on retries. | Your app may accept a poor summary sooner. |
+| `maxHistoryShare` | `0.5` | Default history-budget share a caller can pair with `pruneHistoryForContextShare()`. | Your caller may pass too much history to the summarizer. | Your caller may prune too aggressively. |
+| `identifierPolicy` | `"strict"` | Default policy value for `buildCompactionInstructions()` / `auditSummaryQuality()`. | N/A | `"off"` disables identifier-preservation checks. |
+| `timeoutMs` | `90,000` | Default timeout value available to caller-owned compaction orchestration. | Your app may wait longer on a slow summarizer call. | Your app may time out earlier. |
+| `timeoutMsBase` | `120,000` | Default follow-on timeout value available to callers that implement staged retries. | Same as above. | Same as above. |
+| `timeoutMsCap` | `300,000` | Default upper timeout bound available to callers that implement staged retries. | Same as above. | Same as above. |
+| `oversizedToolResultChars` | `16,000` | Exported default for caller-defined compaction-time tool-result handling. The current `src/` helpers do not read this value directly. | Your app may keep too much oversized content. | Your app may shrink compaction input more aggressively. |
+| `giantToolResultChars` | `64,000` | Exported default for caller-defined giant-result handling during compaction. | Same as above. | Same as above. |
+| `previewHeadChars` | `400` | Exported preview-budget default for caller-owned compaction summaries/snippets. | Longer previews consume more prompt budget. | Shorter previews may omit context. |
+| `previewTailChars` | `400` | Exported tail-preview default for caller-owned compaction summaries/snippets. | Longer previews consume more prompt budget. | Shorter previews may omit important endings. |
+| `maxStabilityRetryStages` | `3` | Exported retry-stage default for callers that implement their own stability/timeout escalation. | More caller-side retry stages. | Fewer caller-side retry stages. |
 
 #### `summarySectionBudgets`
 
 | Parameter | Default | What it does |
 |-----------|---------|-------------|
-| `diagnosticEvidenceChars` | `2,500` | Max chars for diagnostic evidence in preserved messages. |
-| `toolFailuresChars` | `1,800` | Max chars for tool failure details. |
-| `entityPreservedMessagesChars` | `2,200` | Max chars for entity-preserved message context. |
-| `recentTurnsPreservedChars` | `2,200` | Max chars for the recent-turns preservation block. |
+| `diagnosticEvidenceChars` | `2,500` | Exported default budget a caller can use when formatting diagnostic evidence in its own compaction output. |
+| `toolFailuresChars` | `1,800` | Exported default budget a caller can use for tool-failure detail in its own compaction output. |
+| `entityPreservedMessagesChars` | `2,200` | Exported default budget a caller can use for entity-preserved message context. |
+| `recentTurnsPreservedChars` | `2,200` | Exported default budget a caller can use for its recent-turns preservation block. |
 
 ### 4.3 `CompactionInstructionsConfig`
 
@@ -856,7 +857,7 @@ interface CompactionInstructionsConfig {
 | `topicSignalCandidates` | `[]` | Phrases indicating the current topic. Used in quality audit to verify the summary reflects the thread. |
 | `offTopicMarkers` | `[]` | Phrases indicating off-topic contamination. If found in summary, audit fails with `off_topic_todo_contamination`. |
 | `globalStatusPatterns` | `[/current progress/i, /open todos?/i, ...]` | Regex patterns matching global-status rollup messages. These are deprioritized during topic-local compaction. |
-| `metadataLinePrefixes` | `[]` | Additional line prefixes to skip when extracting user request snippets. |
+| `metadataLinePrefixes` | `[]` | Accepted and stored by `configureCompactionInstructions()`, but not currently consulted by `extractRequestSnippet()` / `isMetadataLine()`. |
 | `lowercaseTopicPhrases` | `[]` | Lowercase phrases to extract from user messages as topic anchors (e.g., `"google sheets"`, `"api migration"`). |
 
 ### 4.4 `ContextKitConfig`
@@ -883,7 +884,7 @@ interface ContextKitConfig {
 }
 ```
 
-**`ContextKitPhases`** — Feature flags. Most default to `false`. Core phases (`corePort`, `smartCompaction`, `dynamicAssembly`, `sessionSearch`, `subagentIntelligence`, `turnLearning`) default to `true`.
+**`ContextKitPhases`** — Feature-flag values surfaced by `DEFAULT_CONFIG`. Most default to `false`. Core phase flags (`corePort`, `smartCompaction`, `dynamicAssembly`, `sessionSearch`, `subagentIntelligence`, `turnLearning`) default to `true`. In the current `src/` tree, these flags are resolved and queryable via `isPhaseEnabled()`, but they are not consumed by additional runtime logic here.
 
 ```typescript
 resolveConfig();           // Returns DEFAULT_CONFIG with deep-cloned objects
@@ -904,7 +905,7 @@ type ToolResultHandlingConfigInput = {
   staleClearing?: Record<string, unknown>;   // Partial override of stale clearing
   tools?: Record<string, { mode?: ToolResultHandlingToolMode }>;
   artifactStore?: {
-    enabled?: boolean;   // Default: true (inferred from presence of dir/rootDir)
+    enabled?: boolean;   // Default: true unless explicitly set to false
     dir?: string;        // Default: "tool-artifacts"
     failOpen?: boolean;  // Default: true
     rootDir?: string;    // Default: process.cwd()
@@ -1073,7 +1074,9 @@ Topic / thread locality:
 Tool returns 200K chars
   → classifyToolResultRisk: category = "giant" (exceeds giantChars: 64,000)
   → persistToolResultArtifactSync: stores full content on disk
-  → makeToolResultStub: replaces with ~2,400 char stub (head+tail preview)
+  → makeToolResultStub: replaces it with an artifact-backed stub
+     (by default, 1,200 chars of head preview + 1,200 chars of tail preview,
+      plus stub framing/metadata)
   → Transcript contains only the stub
 ```
 
@@ -1088,7 +1091,8 @@ The stub is ~50x smaller than the original. Compaction never sees the full outpu
 **How agent-context-kit prevents this:**
 
 ```typescript
-// In the sanitizer, before classification:
+// In the sanitizer, after classification and before any artifact write:
+const classification = classifyToolResultRisk(textContent, toolName, config);
 const artifactBackedRead = detectArtifactBackedReadRecovery(
   message, toolName, artifactDir
 );
@@ -1100,7 +1104,7 @@ Three outcomes:
 1. **No chunking parameters (offset/limit):** Returns recovery instructions instead of the read result:
    ```
    [Artifact-backed read requires chunked recovery]
-   Path: /state/tool-artifacts/a3/f8/a3f8c2d1...jsonl
+   Path: /state/tool-artifacts/a3/f8/a3f8c2d1....body
    This read targeted a persisted tool-output artifact.
    Use `read` with offset/limit, or `head`, `tail`, `rg`...
    ```
@@ -1128,7 +1132,7 @@ The system converges: even if the model loops, the context doesn't grow. Each fa
 - Misses the current topic (summarizes old infrastructure chat instead of the current task)
 - Gets contaminated with off-topic TODOs from a global status dump in the history
 
-**How agent-context-kit handles this:**
+**What agent-context-kit provides:**
 
 ```typescript
 const audit = auditSummaryQuality({
@@ -1147,34 +1151,33 @@ const audit = auditSummaryQuality({
 // ]
 ```
 
-On retry, feed `audit.reasons` back to the summarizer as explicit correction instructions.
+The library exports `auditSummaryQuality()` and `buildStructuredFallbackSummary()`, and `resolveConfig()` exposes knobs like `qualityGuardEnabled` / `qualityGuardMaxRetries`. But in the current `src/` tree, the retry loop itself is not implemented here — callers must wire `audit.reasons` back into their summarizer and decide when to fall back.
 
-If retries are exhausted: `buildStructuredFallbackSummary(previousSummary)` returns a minimal valid summary with all required sections. If a previous summary exists and has valid sections, it's reused as-is.
+If you choose to fall back, `buildStructuredFallbackSummary(previousSummary)` returns a minimal valid summary with all required sections. If a previous summary exists and has valid sections, it's reused as-is.
 
 ### 6.5 Compaction Timeout Cascade
 
 **Scenario:** The context is 500K+ characters. The summarizer needs to process a large input. First attempt times out at `timeoutMs` (90s). Retry at `timeoutMsBase` (120s). Still too slow.
 
-**How agent-context-kit handles this:**
+**What agent-context-kit provides today:**
 
-The timeout escalation stages work as follows:
+The config surface exposes the timeout/retry values:
 
 ```
-Stage 0: timeoutMs       (90,000ms)  — initial attempt
-Stage 1: timeoutMsBase   (120,000ms) — first retry
-Stage 2: timeoutMsCap    (300,000ms) — final retry (capped)
+timeoutMs = 90,000ms
+timeoutMsBase = 120,000ms
+timeoutMsCap = 300,000ms
+maxStabilityRetryStages = 3
 ```
 
-Up to `maxStabilityRetryStages` (3) attempts. If all fail:
+However, in the current `src/` tree these are configuration values only; this package does not implement the timeout escalation loop itself. If you want staged retries, you need to build that control flow in your caller and choose how to use `timeoutMs`, `timeoutMsBase`, `timeoutMsCap`, and `maxStabilityRetryStages`.
 
-1. Fall back to `buildStructuredFallbackSummary(previousSummary)`
-2. If no previous summary exists, returns a skeleton with "No prior history."
-
-**Complementary strategies:**
+**Complementary strategies available as utilities:**
 - `pruneHistoryForContextShare()` drops oldest chunks to fit within `maxHistoryShare`
-- `chunkMessagesByMaxTokens()` splits into chunks summarized independently, then merged with `getMergeSummariesInstructions()`
+- `chunkMessagesByMaxTokens()` splits messages into token-bounded chunks, which a caller can summarize independently and then merge with `getMergeSummariesInstructions()`
+- `buildStructuredFallbackSummary()` can be used by the caller if retries/timeouts are exhausted
 
-**Debugging tip:** If compaction consistently times out, your `maxHistoryShare` is too high (keeping too much history), or your summarizer model is too small. Reduce `maxHistoryShare` to 0.3-0.4, or use a faster summarizer model.
+**Debugging tip:** If compaction consistently times out, your `maxHistoryShare` may be too high (keeping too much history), or your summarizer model may be too slow for the input size. Reduce `maxHistoryShare` to 0.3-0.4, or use a faster summarizer model.
 
 ---
 
@@ -1296,7 +1299,7 @@ const compactionConfig = resolveConfig({
 });
 ```
 
-**Trigger compaction at 80-85% pressure.** With 1M tokens, you may never need to compact for short sessions.
+**Source-backed guardrails:** the context guard reserves input headroom at `0.75` of the estimated context budget and throws a preemptive overflow error at `0.9` of the estimated full context (`src/guards/context-guard.ts`). This package does not define a built-in “trigger compaction at 80–85%” threshold in code, so treat any compaction trigger point in your app as an application-level policy choice.
 
 ### 7.2 By Agent Type
 
@@ -1477,6 +1480,8 @@ describe("artifact store", () => {
     expect(meta!.isDuplicate).toBe(false);
     expect(meta!.chars).toBe(50_000);
 
+    expect(checkArtifactExistsSync(meta!.id, artifactDir)).toBe(true);
+
     const envelope = readArtifactSync(meta!.id, artifactDir);
     expect(envelope).not.toBeNull();
     expect(envelope!.content).toBe(content);
@@ -1577,6 +1582,7 @@ import {
   estimateContextChars,
   createMessageCharEstimateCache,
   CHARS_PER_TOKEN_ESTIMATE,
+  ARTIFACT_STUB_MARKER,
   type AgentMessage,
   type ToolResultHandlingConfigInput,
 } from "agent-context-kit";
@@ -1645,24 +1651,28 @@ describe("integration: full agent loop", () => {
     const budget = CONTEXT_WINDOW * CHARS_PER_TOKEN_ESTIMATE * 0.75;
     expect(totalChars).toBeLessThanOrEqual(budget);
 
-    // Verify large outputs were artifacted
+    // Verify large outputs were artifacted (not just that the directory exists)
     const artifactDir = path.join(stateDir, "tool-artifacts");
     expect(fs.existsSync(artifactDir)).toBe(true);
+    expect(messages.some((msg) => {
+      const details = msg.details as Record<string, unknown> | undefined;
+      return details?.[ARTIFACT_STUB_MARKER] === true;
+    })).toBe(true);
   });
 });
 ```
 
 ### 8.5 Metrics to Track
 
-| Metric | What it tells you | Target range |
-|--------|------------------|--------------|
-| **Artifact hit rate** | % of tool results that get artifact-stored | 10-30% for coding agents (lower means thresholds are too high) |
-| **Deduplication rate** | % of artifact persists that are deduplicates | Varies; high rate means the agent is re-reading the same files |
-| **Compaction frequency** | How often compaction triggers per session | Once every 20-50 turns. More = thresholds too low or context window too small |
-| **Context utilization** | `currentChars / budgetChars` over time | Should hover 50-80%. Consistently >90% means compaction isn't keeping up |
-| **Truncation rate** | % of tool results that get inline-truncated (not artifacted) | 5-15%. Higher means many "medium" outputs; consider lowering `inlineSoftChars` |
-| **Quality audit pass rate** | % of compaction summaries passing first-try audit | >80%. Below 60% means summarizer model is weak or instructions need tuning |
-| **Compaction timeout rate** | % of compaction attempts that timeout | <5%. Higher means context is too large for the summarizer or timeouts too low |
+| Metric | What it tells you | How to interpret it |
+|--------|------------------|---------------------|
+| **Artifact hit rate** | % of tool results that get artifact-stored | Higher values usually mean your thresholds are lower or your tools produce larger outputs. Lower values usually mean more content stays inline. |
+| **Deduplication rate** | % of artifact persists that are deduplicates | High values usually mean the agent is re-reading or regenerating the same large content. |
+| **Compaction frequency** | How often compaction triggers per session | Rising frequency usually means your app's budgets are tight relative to message volume. |
+| **Context utilization** | `currentChars / budgetChars` over time | Sustained high utilization means your app is spending most of its headroom and may need earlier compaction or tighter tool-result handling. |
+| **Truncation rate** | % of tool results that get inline-truncated (not artifacted) | High values mean many results are landing between your inline and artifact thresholds. |
+| **Quality audit pass rate** | % of compaction summaries passing first-try audit | Lower pass rates usually mean your summarizer prompt/model or locality setup needs adjustment. |
+| **Compaction timeout rate** | % of compaction attempts that timeout | Higher values usually mean the summarizer input is too large, the model is too slow, or your app-side timeouts are too aggressive. |
 
 ---
 
@@ -1802,7 +1812,7 @@ import {
   SUMMARIZATION_OVERHEAD_TOKENS,
   isTransportOrMetadataIdentifier,
   estimateTokens,
-  extractMessageTextFromEntry,
+  extractMessageText,
   stripToolResultDetails,
   estimateMessagesTokens,
   splitMessagesByTokenShare,
@@ -1835,12 +1845,18 @@ interface AgentMessage {
 type MessageContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; url?: string; data?: string; mimeType?: string }
-  | { type: "toolCall" | "toolUse" | "tool_use"; name?: string; input?: Record<string, unknown> }
+  | {
+      type: "toolCall" | "toolUse" | "tool_use";
+      name?: string;
+      toolName?: string;
+      input?: Record<string, unknown>;
+      arguments?: Record<string, unknown>;
+    }
   | { type: "thinking"; thinking: string }
   | Record<string, unknown>;
 ```
 
-**Key convention:** Tool results use `role: "toolResult"` (or `role: "tool"` — both are recognized). The content should be an array with at least one `{ type: "text", text: "..." }` block. The `details` field carries tool-specific metadata (exit codes, paths, etc.) and is included in char estimation but cleared during context pressure.
+**Key convention:** Tool results use `role: "toolResult"` (or `role: "tool"` — both are recognized). For best interoperability, use an array with at least one `{ type: "text", text: "..." }` block. Some helpers accept string `content` (for example the async sanitizer and char-estimation helpers), but the synchronous session-guard sanitization path extracts text from text blocks. The `details` field carries tool-specific metadata (exit codes, paths, etc.); it contributes to char estimation, and guard paths may strip, cap, or preserve parts of it depending on whether they are compacting content or preserving artifact-stub markers.
 
 **Mapping from OpenAI format:**
 
@@ -1876,15 +1892,15 @@ const agentMsg: AgentMessage = {
 | `classifyToolResultRisk` | Pure function, never throws | No |
 | `sanitizeToolResultForPersistence` | Catches artifact errors if `failOpen` is set; returns `usedFallback: true` | Only if `failOpen: false` AND artifact write fails |
 | `persistToolResultArtifactSync` | Returns `null` on error if `failOpen: true` | Only if `failOpen: false` |
-| `createSyncSanitizerTransform` | The returned transform catches errors and falls back to inline truncation | No (fails open) |
-| `guardToolResultMessage` | Wraps the full pipeline with invariant enforcement | No (fails open by default) |
+| `createSyncSanitizerTransform` | Usually fails open for artifact-write issues when `artifactStore.failOpen` is left at its default `true`, but it can still throw during setup or persistence when fail-open is disabled | Yes, in some configurations |
+| `guardToolResultMessage` | Wraps the sanitizer + invariant enforcement, but it does not swallow exceptions from `createSyncSanitizerTransform` / hooks | Yes, if the sanitizer setup or hooks throw |
 | `enforceToolResultContextBudgetInPlace` | Mutates in place, never throws | No |
-| `installToolResultContextGuard` | The installed `transformContext` throws `Error` with `PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE` if context exceeds 90% after enforcement | Yes — intentional overflow signal |
+| `installToolResultContextGuard` | The installed `transformContext` throws `Error` with `PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE` if post-enforcement context still exceeds the computed preemptive overflow threshold | Yes — intentional overflow signal |
 | `auditSummaryQuality` | Pure function, returns `{ ok, reasons }` | No |
 | `buildStructuredFallbackSummary` | Always returns a valid string | No |
 | `pruneArtifacts` | Catches errors per-file, continues | No |
 
-**Design principle:** The entire system is designed to fail open. If artifact storage fails, content is truncated inline. If the sanitizer encounters unexpected input, it returns the message unchanged. If compaction fails, a structured fallback is used. The only intentional throw is the context overflow signal from `installToolResultContextGuard`, which your agent loop should catch and use as a compaction trigger.
+**Design principle:** Artifact-write paths default to fail-open behavior, so persistence problems usually degrade to inline truncation instead of hard failure. Several APIs can still throw when `failOpen` is disabled or inputs/config are invalid (for example invalid artifact IDs/directories, caller-thrown hooks, or the intentional overflow signal from `installToolResultContextGuard`). If you want structured fallback behavior during compaction, wire `buildStructuredFallbackSummary()` into your caller-owned compaction loop.
 
 ---
 
